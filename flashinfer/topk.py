@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import os
 from types import SimpleNamespace
 from typing import Optional, Tuple
 
@@ -37,6 +38,7 @@ def get_topk_module():
         top_k: int,
         row_states_buffer: Optional[torch.Tensor],
         output_values: torch.Tensor,
+        sorted_output: bool = False,
     ) -> torch.Tensor:
         device = input.device
         # Supports float32, float16, bfloat16
@@ -48,7 +50,12 @@ def get_topk_module():
             batch_size, top_k, dtype=torch.int32, device=device
         )
         module.radix_topk(
-            input, output_indices, output_values, row_states_buffer, top_k
+            input,
+            output_indices,
+            output_values,
+            row_states_buffer,
+            top_k,
+            sorted_output,
         )
         return output_indices
 
@@ -58,6 +65,7 @@ def get_topk_module():
         top_k: int,
         row_states_buffer: Optional[torch.Tensor],
         output_values: torch.Tensor,
+        sorted_output: bool = False,
     ) -> torch.Tensor:
         batch_size = input.size(0)
         return torch.empty(batch_size, top_k, dtype=torch.int32, device=input.device)
@@ -221,6 +229,7 @@ def top_k(
     """
     batch_size = input.size(0)
     device = input.device
+    deterministic = os.environ.get("FLASHINFER_DETERMINISTIC_TOPK", "0") == "1"
 
     # Allocate row_states buffer for multi-CTA path
     # 1MB is enough for any reasonable GPU (covers up to ~500 groups)
@@ -234,15 +243,18 @@ def top_k(
     # Allocate output_values for kernel to write directly
     output_values = torch.empty(batch_size, k, dtype=input.dtype, device=device)
 
-    # Get indices using radix-based selection
+    # For deterministic + sorted: CUDA handles combined value+index sort in one kernel.
+    # For non-deterministic + sorted: use torch.sort.
+    # For deterministic + unsorted: CUDA handles index-only sort.
+    sorted_cuda = 1 if (sorted and deterministic) else 0
     indices_int32 = get_topk_module().radix_topk(
-        input, k, row_states_buffer, output_values
+        input, k, row_states_buffer, output_values, sorted_cuda
     )
 
     # Convert to int64 for compatibility
     indices = indices_int32.long()
 
-    if sorted:
+    if sorted and not sorted_cuda:
         # Sort within each row by value (descending)
         sorted_values, sort_indices = torch.sort(output_values, dim=-1, descending=True)
         sorted_indices = torch.gather(indices, dim=-1, index=sort_indices)
