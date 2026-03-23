@@ -1271,7 +1271,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
           if (chunk_start + i < k) {
             row_output[chunk_start + i] = static_cast<IdType>(chunk_start + i);
             output_values[row_idx * top_k_val + chunk_start + i] =
-                input[row_idx * stride + chunk_start + i];
+                input[static_cast<size_t>(row_idx) * stride + chunk_start + i];
           }
         }
         // Clear histogram for next iteration (in case it's k < length)
@@ -1343,7 +1343,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
 
     // Stage 1: Load and convert to ordered representation
     LoadToSharedOrdered<BLOCK_THREADS, VEC_SIZE, DType, Traits>(
-        input + row_idx * stride, shared_ordered, chunk_start, actual_chunk_size, tx);
+        input + static_cast<size_t>(row_idx) * stride, shared_ordered, chunk_start,
+        actual_chunk_size, tx);
 
     // Stage 2: Radix select to find k-th largest element (also computes local_gt_count)
     uint32_t local_gt_count = 0;
@@ -2035,7 +2036,8 @@ inline cudaError_t GetRadixTopKLaunchConfig(uint32_t num_rows, uint32_t top_k_va
   const bool single_cta = (ctas_per_group == 1);
   const uint32_t block_threads = GetDeterministicTopKBlockThreads(
       ctas_per_group, max_len, deterministic, BLOCK_THREADS, SHORT_BLOCK_THREADS);
-  const uint32_t smem_size = fixed_smem_aligned + chunk_size * sizeof(OrderedType);
+  const uint32_t smem_size =
+      fixed_smem_aligned + static_cast<size_t>(chunk_size) * sizeof(OrderedType);
 
   uint32_t num_groups = std::min(static_cast<uint32_t>(num_sms) / ctas_per_group, num_rows);
   if (num_groups == 0) num_groups = 1;
@@ -2403,7 +2405,7 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
   if (bid >= num_rows) return;
 
   const int length = (lengths != nullptr) ? lengths[bid] : static_cast<int>(max_len);
-  const DType* score = input + bid * max_len;
+  const DType* score = input + static_cast<size_t>(bid) * max_len;
   IdType* dst = output + bid * top_k;
 
   // Mode-specific setup
@@ -3145,6 +3147,89 @@ cudaError_t SortTopKRaggedByIndex(IdType* output_indices, const IdType* offsets,
       max_len, stream);
 }
 
+/*!
+ * \brief CUB stable radix sort: sorts top-k by value descending, carrying indices.
+ *
+ * Uses 32-bit flipped ordered value as key and 32-bit index as satellite data.
+ * Since radix sort is stable, equal values preserve their prior relative order.
+ * When preceded by an index sort, this yields (value desc, index asc) ordering.
+ */
+template <uint32_t BLOCK_THREADS, uint32_t ITEMS_PER_THREAD, typename IdType, typename DType>
+__global__ void __launch_bounds__(BLOCK_THREADS)
+    StableSortTopKByValueKernel(IdType* output_indices, DType* output_values, uint32_t k,
+                                uint32_t /*max_len*/) {
+  using Traits = RadixTopKTraits<DType>;
+  using OrderedType = typename Traits::OrderedType;
+  using BlockRadixSortT = cub::BlockRadixSort<uint32_t, BLOCK_THREADS, ITEMS_PER_THREAD, uint32_t>;
+  __shared__ typename BlockRadixSortT::TempStorage temp_storage;
+
+  const uint32_t row = blockIdx.x;
+  const uint32_t tx = threadIdx.x;
+
+  IdType* row_indices = output_indices + static_cast<size_t>(row) * k;
+  DType* row_values = output_values + static_cast<size_t>(row) * k;
+
+  uint32_t keys[ITEMS_PER_THREAD];
+  uint32_t indices[ITEMS_PER_THREAD];
+
+#pragma unroll
+  for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
+    uint32_t pos = tx * ITEMS_PER_THREAD + i;
+    if (pos < k) {
+      OrderedType ordered = Traits::ToOrdered(row_values[pos]);
+      keys[i] = static_cast<uint32_t>(static_cast<OrderedType>(~ordered));
+      indices[i] = static_cast<uint32_t>(row_indices[pos]);
+    } else {
+      keys[i] = ~0u;
+      indices[i] = ~0u;
+    }
+  }
+
+  constexpr int end_bit = sizeof(OrderedType) * 8;
+  BlockRadixSortT(temp_storage).Sort(keys, indices, 0, end_bit);
+
+#pragma unroll
+  for (uint32_t i = 0; i < ITEMS_PER_THREAD; i++) {
+    uint32_t pos = tx * ITEMS_PER_THREAD + i;
+    if (pos < k) {
+      row_indices[pos] = static_cast<IdType>(indices[i]);
+      OrderedType ordered = static_cast<OrderedType>(~static_cast<OrderedType>(keys[i]));
+      row_values[pos] = Traits::FromOrdered(ordered);
+    }
+  }
+}
+
+template <typename DType, typename IdType>
+cudaError_t StableSortTopKByValue(IdType* output_indices, DType* output_values, uint32_t num_rows,
+                                  uint32_t top_k_val, uint32_t max_len, cudaStream_t stream = 0) {
+  if (top_k_val <= 1) {
+    return cudaSuccess;
+  }
+
+  dim3 grid(num_rows);
+  void* args[] = {&output_indices, &output_values, &top_k_val, &max_len};
+  auto launch_sort = [&](auto kernel, uint32_t threads) -> cudaError_t {
+    dim3 block(threads);
+    return cudaLaunchKernel((void*)kernel, grid, block, args, 0, stream);
+  };
+
+  cudaError_t status;
+  if (top_k_val <= 128)
+    status = launch_sort(StableSortTopKByValueKernel<32, 4, IdType, DType>, 32);
+  else if (top_k_val <= 256)
+    status = launch_sort(StableSortTopKByValueKernel<32, 8, IdType, DType>, 32);
+  else if (top_k_val <= 512)
+    status = launch_sort(StableSortTopKByValueKernel<64, 8, IdType, DType>, 64);
+  else if (top_k_val <= 576)
+    status = launch_sort(StableSortTopKByValueKernel<64, 9, IdType, DType>, 64);
+  else if (top_k_val <= 1024)
+    status = launch_sort(StableSortTopKByValueKernel<128, 8, IdType, DType>, 128);
+  else
+    status = launch_sort(StableSortTopKByValueKernel<256, 8, IdType, DType>, 256);
+
+  return status;
+}
+
 template <FilteredTopKMode MODE, typename DType, typename IdType>
 cudaError_t LaunchFilteredTopKUnified(DType* input, IdType* output, DType* aux_output,
                                       const IdType* aux_input, int64_t aux_stride,
@@ -3438,8 +3523,8 @@ cudaError_t TopKRaggedTransformDispatch(DType* input, IdType* output_indices, co
 template <typename DType, typename IdType>
 cudaError_t TopKDispatch(DType* input, IdType* output_indices, DType* output_values,
                          uint32_t num_rows, uint32_t top_k_val, uint32_t max_len,
-                         RadixRowState* row_states_buffer, bool deterministic,
-                         cudaStream_t stream = 0) {
+                         RadixRowState* row_states_buffer, bool sorted_output = false,
+                         bool deterministic = false, cudaStream_t stream = 0) {
   const TopKAlgoOverride algo_override = GetTopKAlgoOverride();
   const bool can_implement_filtered = CanImplementFilteredTopK();
   auto run_filtered = [&]() -> cudaError_t {
@@ -3452,10 +3537,17 @@ cudaError_t TopKDispatch(DType* input, IdType* output_indices, DType* output_val
     if (deterministic) {
       // Plain deterministic top-k only needs repeatable output order, so sort
       // the selected set by index instead of rebuilding the full row in-kernel.
-      cudaError_t sort_status = SortTopKByIndex<DType, IdType>(
-          output_indices, output_values, num_rows, top_k_val, max_len, stream);
-      if (sort_status != cudaSuccess) {
-        return sort_status;
+      status = SortTopKByIndex<DType, IdType>(output_indices, output_values, num_rows, top_k_val,
+                                              max_len, stream);
+      if (status != cudaSuccess) {
+        return status;
+      }
+      if (sorted_output) {
+        status = StableSortTopKByValue<DType, IdType>(output_indices, output_values, num_rows,
+                                                      top_k_val, max_len, stream);
+        if (status != cudaSuccess) {
+          return status;
+        }
       }
     }
     return cudaSuccess;
@@ -3478,9 +3570,27 @@ cudaError_t TopKDispatch(DType* input, IdType* output_indices, DType* output_val
     }
     return status;
   }
-  return RadixTopKMultiCTA<DType, IdType>(input, output_indices, output_values, nullptr, num_rows,
-                                          top_k_val, max_len, row_states_buffer, config,
-                                          deterministic, stream);
+  status = RadixTopKMultiCTA<DType, IdType>(input, output_indices, output_values, nullptr, num_rows,
+                                            top_k_val, max_len, row_states_buffer, config,
+                                            deterministic, stream);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  if (deterministic) {
+    status = SortTopKByIndex<DType, IdType>(output_indices, output_values, num_rows, top_k_val,
+                                            max_len, stream);
+    if (status != cudaSuccess) {
+      return status;
+    }
+    if (sorted_output) {
+      status = StableSortTopKByValue<DType, IdType>(output_indices, output_values, num_rows,
+                                                    top_k_val, max_len, stream);
+      if (status != cudaSuccess) {
+        return status;
+      }
+    }
+  }
+  return cudaSuccess;
 }
 
 }  // namespace sampling

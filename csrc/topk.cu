@@ -34,7 +34,7 @@ bool ParseDeterministic(int64_t mode) {
 }  // namespace
 
 void radix_topk(TensorView input, TensorView output_indices, TensorView output_values,
-                Optional<TensorView> maybe_row_states_buffer, int64_t top_k,
+                Optional<TensorView> maybe_row_states_buffer, int64_t top_k, int64_t sorted_output,
                 int64_t deterministic_mode) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_indices);
@@ -65,7 +65,7 @@ void radix_topk(TensorView input, TensorView output_indices, TensorView output_v
     status = sampling::TopKDispatch<c_type, int32_t>(
         static_cast<c_type*>(input.data_ptr()), static_cast<int32_t*>(output_indices.data_ptr()),
         static_cast<c_type*>(output_values.data_ptr()), batch_size, static_cast<uint32_t>(top_k), d,
-        row_states_ptr, deterministic, stream);
+        row_states_ptr, static_cast<bool>(sorted_output), deterministic, stream);
     return true;
   });
 
